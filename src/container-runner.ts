@@ -33,6 +33,22 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+const DEFAULT_SETTINGS = {
+  autoCompactEnabled: true,
+  model: 'claude-sonnet-4-6',
+  env: {
+    // Enable agent swarms (subagent orchestration)
+    // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+    // Load CLAUDE.md from additional mounted directories
+    // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+    CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+    // Enable Claude's memory feature (persists user preferences between sessions)
+    // https://code.claude.com/docs/en/memory#manage-auto-memory
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  },
+} as const;
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -124,26 +140,14 @@ function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
+    fs.writeFileSync(settingsFile, JSON.stringify(DEFAULT_SETTINGS, null, 2) + '\n');
+  } else {
+    // Ensure autoCompactEnabled and model are set on existing settings files
+    const existing = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+    let dirty = false;
+    if (existing.autoCompactEnabled !== true) { existing.autoCompactEnabled = true; dirty = true; }
+    if (!existing.model) { existing.model = 'claude-sonnet-4-6'; dirty = true; }
+    if (dirty) fs.writeFileSync(settingsFile, JSON.stringify(existing, null, 2) + '\n');
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
