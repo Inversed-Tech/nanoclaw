@@ -140,14 +140,24 @@ function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(settingsFile, JSON.stringify(DEFAULT_SETTINGS, null, 2) + '\n');
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify(DEFAULT_SETTINGS, null, 2) + '\n',
+    );
   } else {
     // Ensure autoCompactEnabled and model are set on existing settings files
     const existing = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
     let dirty = false;
-    if (existing.autoCompactEnabled !== true) { existing.autoCompactEnabled = true; dirty = true; }
-    if (!existing.model) { existing.model = 'claude-sonnet-4-6'; dirty = true; }
-    if (dirty) fs.writeFileSync(settingsFile, JSON.stringify(existing, null, 2) + '\n');
+    if (existing.autoCompactEnabled !== true) {
+      existing.autoCompactEnabled = true;
+      dirty = true;
+    }
+    if (!existing.model) {
+      existing.model = 'claude-sonnet-4-6';
+      dirty = true;
+    }
+    if (dirty)
+      fs.writeFileSync(settingsFile, JSON.stringify(existing, null, 2) + '\n');
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
