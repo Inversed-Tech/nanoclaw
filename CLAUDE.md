@@ -43,6 +43,10 @@ Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) f
 
 Before creating a PR, adding a skill, or preparing any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md). It covers accepted change types, the four skill types and their guidelines, SKILL.md format rules, PR requirements, and the pre-submission checklist (searching for existing PRs/issues, testing, description format).
 
+## Service Availability
+
+**Always keep the nanoclaw service running.** After any code change, build, restart, or troubleshooting session, verify the service is active before finishing: `systemctl --user is-active nanoclaw`. If it's not running, restart it. Never leave the service stopped.
+
 ## Development
 
 Run commands directly—don't tell the user to run them.

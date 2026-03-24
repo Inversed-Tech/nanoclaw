@@ -1,13 +1,17 @@
+import fs from 'fs';
+import path from 'path';
+
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  MessageAttachment,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
@@ -16,6 +20,20 @@ import {
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
+
+// Health check interval: ping Slack every 5 minutes to detect stale sockets.
+const HEALTH_CHECK_MS = 5 * 60 * 1000;
+
+// Image MIME types we download and pass to the agent as visual content.
+const IMAGE_MIMETYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+]);
+
+// Max image file size to download (10 MB)
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
@@ -37,6 +55,8 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  private healthTimer: ReturnType<typeof setInterval> | undefined;
+  private reconnecting = false;
 
   private opts: SlackChannelOpts;
 
@@ -72,12 +92,17 @@ export class SlackChannel implements Channel {
       // Bolt's event type is the full MessageEvent union (17+ subtypes).
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
-      if (subtype && subtype !== 'bot_message') return;
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share')
+        return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
 
-      if (!msg.text) return;
+      // Extract image files from the message (if any)
+      const files = (msg as GenericMessageEvent).files;
+      const hasFiles = files && files.length > 0;
+
+      if (!msg.text && !hasFiles) return;
 
       // Threaded replies are flattened into the channel conversation.
       // The agent sees them alongside channel-level messages; responses
@@ -109,7 +134,7 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text;
+      let content = msg.text || '';
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
         if (
@@ -118,6 +143,21 @@ export class SlackChannel implements Channel {
         ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
+      }
+
+      // Download image attachments (never crash if download/permissions fail)
+      let attachments: MessageAttachment[] = [];
+      try {
+        attachments = await this.downloadImageFiles(
+          files,
+          groups[jid].folder,
+          msg.ts,
+        );
+      } catch (err) {
+        logger.warn(
+          { err, jid },
+          'Failed to download image attachments, delivering message without them',
+        );
       }
 
       this.opts.onMessage(jid, {
@@ -129,6 +169,7 @@ export class SlackChannel implements Channel {
         timestamp,
         is_from_me: isBotMessage,
         is_bot_message: isBotMessage,
+        attachments: attachments.length > 0 ? attachments : undefined,
       });
     });
   }
@@ -154,6 +195,9 @@ export class SlackChannel implements Channel {
 
     // Sync channel names on startup
     await this.syncChannelMetadata();
+
+    // Start periodic health checks to detect stale sockets
+    this.startHealthCheck();
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -200,7 +244,59 @@ export class SlackChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
     await this.app.stop();
+  }
+
+  private startHealthCheck(): void {
+    this.healthTimer = setInterval(() => {
+      this.checkHealth().catch(() => {});
+    }, HEALTH_CHECK_MS);
+  }
+
+  private async checkHealth(): Promise<void> {
+    if (!this.connected || this.reconnecting) return;
+
+    try {
+      await this.app.client.auth.test();
+    } catch (err) {
+      logger.warn({ err }, 'Slack health check failed, reconnecting');
+      await this.reconnect();
+    }
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+
+    try {
+      this.connected = false;
+      try {
+        await this.app.stop();
+      } catch {
+        // already stopped
+      }
+
+      await this.app.start();
+
+      try {
+        const auth = await this.app.client.auth.test();
+        this.botUserId = auth.user_id as string;
+      } catch {
+        // non-fatal — botUserId is already set from initial connect
+      }
+
+      this.connected = true;
+      logger.info('Slack reconnected after health check failure');
+      await this.flushOutgoingQueue();
+    } catch (err) {
+      logger.error({ err }, 'Slack reconnect failed');
+    } finally {
+      this.reconnecting = false;
+    }
   }
 
   // Slack does not expose a typing indicator API for bots.
@@ -259,6 +355,70 @@ export class SlackChannel implements Channel {
       logger.debug({ userId, err }, 'Failed to resolve Slack user name');
       return undefined;
     }
+  }
+
+  private async downloadImageFiles(
+    files: GenericMessageEvent['files'] | undefined,
+    groupFolder: string,
+    messageTs: string,
+  ): Promise<MessageAttachment[]> {
+    if (!files || files.length === 0) return [];
+
+    const attachments: MessageAttachment[] = [];
+    const attachDir = path.join(DATA_DIR, 'attachments', groupFolder);
+    fs.mkdirSync(attachDir, { recursive: true });
+
+    const botToken = readEnvFile(['SLACK_BOT_TOKEN']).SLACK_BOT_TOKEN;
+    if (!botToken) return [];
+
+    for (const file of files) {
+      if (!file.mimetype || !IMAGE_MIMETYPES.has(file.mimetype)) continue;
+      if ((file.size ?? 0) > MAX_IMAGE_SIZE) {
+        logger.debug(
+          { fileId: file.id, size: file.size },
+          'Slack image too large, skipping',
+        );
+        continue;
+      }
+
+      const url = file.url_private_download || file.url_private;
+      if (!url) continue;
+
+      try {
+        const resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${botToken}` },
+        });
+        if (!resp.ok) {
+          logger.warn(
+            { fileId: file.id, status: resp.status },
+            'Failed to download Slack image',
+          );
+          continue;
+        }
+
+        const ext = file.filetype || file.mimetype.split('/')[1] || 'bin';
+        const safeName = `${messageTs.replace('.', '-')}-${file.id}.${ext}`;
+        const filePath = path.join(attachDir, safeName);
+
+        const buffer = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(filePath, buffer);
+
+        attachments.push({
+          filename: file.name || safeName,
+          mimetype: file.mimetype,
+          hostPath: filePath,
+        });
+
+        logger.info(
+          { fileId: file.id, filename: file.name, size: buffer.length },
+          'Slack image downloaded',
+        );
+      } catch (err) {
+        logger.warn({ fileId: file.id, err }, 'Error downloading Slack image');
+      }
+    }
+
+    return attachments;
   }
 
   private async flushOutgoingQueue(): Promise<void> {

@@ -1,3 +1,5 @@
+import path from 'path';
+
 import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
 
@@ -16,7 +18,15 @@ export function formatMessages(
 ): string {
   const lines = messages.map((m) => {
     const displayTime = formatLocalTime(m.timestamp, timezone);
-    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
+    let body = escapeXml(m.content);
+    if (m.attachments && m.attachments.length > 0) {
+      const attachLines = m.attachments.map(
+        (a) =>
+          `<attachment filename="${escapeXml(a.filename)}" mimetype="${escapeXml(a.mimetype)}" path="/workspace/attachments/${escapeXml(path.basename(a.hostPath))}" />`,
+      );
+      body += '\n' + attachLines.join('\n');
+    }
+    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${body}</message>`;
   });
 
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;
