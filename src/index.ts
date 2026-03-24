@@ -1,4 +1,5 @@
 import fs from 'fs';
+import type { Server as HttpServer } from 'http';
 import path from 'path';
 
 import {
@@ -43,6 +44,8 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { startHostRequestWatcher } from './host-request-watcher.js';
+import { startHostRequestServer } from './host-request-server.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -482,10 +485,13 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  let approvalServer: HttpServer | null = null;
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    approvalServer?.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -613,6 +619,15 @@ async function main(): Promise<void> {
       if (text) await channel.sendMessage(jid, text);
     },
   });
+  const sendMessageForJid = async (jid: string, text: string) => {
+    const channel = findChannel(channels, jid);
+    if (!channel) throw new Error(`No channel for JID: ${jid}`);
+    return channel.sendMessage(jid, text);
+  };
+
+  startHostRequestWatcher({ sendMessage: sendMessageForJid });
+  approvalServer = startHostRequestServer({ sendMessage: sendMessageForJid });
+
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);

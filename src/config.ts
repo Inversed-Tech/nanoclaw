@@ -71,3 +71,7 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Host work approval server
+export const APPROVAL_PORT = parseInt(process.env.APPROVAL_PORT || '7878', 10);
+export const APPROVAL_PASSWORD = process.env.APPROVAL_PASSWORD || '';
