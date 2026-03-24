@@ -333,6 +333,53 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+const HOST_REQUESTS_DIR = path.join(IPC_DIR, 'host-requests');
+
+server.tool(
+  'request_host_work',
+  `Request the HOST machine (outside the container) to perform privileged work: git commits, system changes, installing software, etc.
+
+The user will receive a link to review your request and approve or reject it. Once approved, Claude runs autonomously on the host until the task is done. You'll receive a notification with the result.
+
+Include everything Claude on the host needs in the prompt: absolute file paths, exact commands, expected outcome, and any context from the current conversation. Write the prompt as if instructing another Claude instance.`,
+  {
+    title: z.string().describe('Short title for the request (shown in approval UI)'),
+    description: z.string().describe('Brief description of what and why'),
+    prompt: z.string().describe('Full prompt for Claude on the host. Include: file paths, commands, verification steps, and context.'),
+    cwd: z.string().describe('Working directory on the HOST where Claude should run (absolute path)'),
+  },
+  async (args) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+    const request = {
+      id,
+      created_at: new Date().toISOString(),
+      group_jid: chatJid,
+      title: args.title,
+      description: args.description,
+      prompt: args.prompt,
+      cwd: args.cwd,
+      status: 'pending',
+    };
+
+    writeIpcFile(HOST_REQUESTS_DIR, request);
+
+    // Also write as {id}.json so the host watcher can find it by ID
+    fs.mkdirSync(HOST_REQUESTS_DIR, { recursive: true });
+    const idFile = path.join(HOST_REQUESTS_DIR, `${id}.json`);
+    const tmp = `${idFile}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(request, null, 2));
+    fs.renameSync(tmp, idFile);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `📋 Host work request prepared: **${args.title}** (id: ${id}). Waiting for user approval.`,
+      }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
