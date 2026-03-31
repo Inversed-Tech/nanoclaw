@@ -7,9 +7,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -330,6 +332,85 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Host request tool — allows the container agent to request privileged work
+// on the host machine, with Gateway-mediated approval.
+// ---------------------------------------------------------------------------
+
+const HOST_REQUESTS_DIR = path.join(IPC_DIR, 'host-requests');
+
+async function pollForResult(id: string): Promise<CallToolResult> {
+  const resultPath = path.join(HOST_REQUESTS_DIR, `${id}.result.json`);
+  const POLL_MS = 5_000;
+  const TIMEOUT_MS = 10 * 60 * 1000; // 10 min
+  const deadline = Date.now() + TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (fs.existsSync(resultPath)) {
+      const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+      const text =
+        result.status === 'completed'
+          ? `Completed (Gateway #${result.gateway_id})\n${result.output_summary}`
+          : result.status === 'rejected'
+            ? `Rejected${result.rejection_reason ? ': ' + result.rejection_reason : ''}`
+            : `Failed\n${result.output_summary}`;
+      return { content: [{ type: 'text' as const, text }] };
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+  return {
+    content: [
+      { type: 'text' as const, text: 'Timed out waiting for host task result.' },
+    ],
+  };
+}
+
+server.tool(
+  'request_host_work',
+  'Request Claude on the host to perform privileged work (git commits, config changes, '
+    + 'new integrations, etc.). The user will receive a link to review and approve. '
+    + 'Claude runs autonomously after approval. Returns when the task completes.',
+  {
+    title: z.string().describe('Short title shown in the approval UI (max 80 chars)'),
+    description: z.string().describe('Human-readable summary of what will happen'),
+    prompt: z.string().describe(
+      'Full instructions for the host Claude. Include: exact file paths, '
+        + 'commands to run, and what "done" looks like.',
+    ),
+    cwd: z.string().optional().describe(
+      'Working directory on the HOST for Claude (e.g. /home/ubuntu/nanoclaw)',
+    ),
+  },
+  async ({ title, description, prompt, cwd }) => {
+    // Write full request to IPC file — prompt goes to disk, not into LLM output
+    const id = randomUUID();
+    fs.mkdirSync(HOST_REQUESTS_DIR, { recursive: true });
+    const requestPath = path.join(HOST_REQUESTS_DIR, `${id}.json`);
+    const tmpPath = `${requestPath}.tmp`;
+    fs.writeFileSync(
+      tmpPath,
+      JSON.stringify(
+        {
+          id,
+          title,
+          description,
+          prompt,
+          cwd,
+          status: 'pending',
+          sourceGroup: groupFolder,
+          created_at: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+    );
+    fs.renameSync(tmpPath, requestPath);
+
+    // Poll for result file (written by host)
+    return await pollForResult(id);
   },
 );
 

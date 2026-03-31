@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 
-import { App, LogLevel } from '@slack/bolt';
+import boltPkg from '@slack/bolt';
+const { App, HTTPReceiver, LogLevel } = boltPkg as any;
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
@@ -24,16 +25,11 @@ const MAX_MESSAGE_LENGTH = 4000;
 // Health check interval: ping Slack every 5 minutes to detect stale sockets.
 const HEALTH_CHECK_MS = 5 * 60 * 1000;
 
-// Image MIME types we download and pass to the agent as visual content.
-const IMAGE_MIMETYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-]);
+// Default port for HTTP webhook receiver.
+const DEFAULT_WEBHOOK_PORT = 3000;
 
-// Max image file size to download (10 MB)
-const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+// Max file size to download (10 MB)
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
@@ -49,7 +45,9 @@ export interface SlackChannelOpts {
 export class SlackChannel implements Channel {
   name = 'slack';
 
-  private app: App;
+  private app: InstanceType<typeof App>;
+  private mode: 'socket' | 'webhook';
+  private webhookListenOpts: { port: number; host: string } | undefined;
   private botUserId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
@@ -65,22 +63,50 @@ export class SlackChannel implements Channel {
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
     // so they don't leak to child processes, matching NanoClaw's security pattern)
-    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
+    const env = readEnvFile([
+      'SLACK_BOT_TOKEN',
+      'SLACK_APP_TOKEN',
+      'SLACK_SIGNING_SECRET',
+      'SLACK_PORT',
+      'SLACK_HOST',
+    ]);
     const botToken = env.SLACK_BOT_TOKEN;
     const appToken = env.SLACK_APP_TOKEN;
+    const signingSecret = env.SLACK_SIGNING_SECRET;
 
-    if (!botToken || !appToken) {
-      throw new Error(
-        'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env',
-      );
+    if (!botToken) {
+      throw new Error('SLACK_BOT_TOKEN must be set in .env');
     }
 
-    this.app = new App({
-      token: botToken,
-      appToken,
-      socketMode: true,
-      logLevel: LogLevel.ERROR,
-    });
+    if (appToken) {
+      // Socket Mode: bidirectional WebSocket, no public URL required.
+      this.mode = 'socket';
+      this.app = new App({
+        token: botToken,
+        appToken,
+        socketMode: true,
+        logLevel: LogLevel.ERROR,
+      });
+    } else if (signingSecret) {
+      // HTTP Webhook mode: Slack POSTs events to /slack/events.
+      // Requires a public URL pointed at SLACK_PORT (default: 3000).
+      this.mode = 'webhook';
+      const port = env.SLACK_PORT
+        ? parseInt(env.SLACK_PORT, 10)
+        : DEFAULT_WEBHOOK_PORT;
+      const host = env.SLACK_HOST ?? '127.0.0.1';
+      this.webhookListenOpts = { port, host };
+      const receiver = new HTTPReceiver({ signingSecret, port });
+      this.app = new App({
+        token: botToken,
+        receiver,
+        logLevel: LogLevel.ERROR,
+      });
+    } else {
+      throw new Error(
+        'Either SLACK_APP_TOKEN (Socket Mode) or SLACK_SIGNING_SECRET (HTTP webhooks) must be set in .env',
+      );
+    }
 
     this.setupEventHandlers();
   }
@@ -88,7 +114,7 @@ export class SlackChannel implements Channel {
   private setupEventHandlers(): void {
     // Use app.event('message') instead of app.message() to capture all
     // message subtypes including bot_message (needed to track our own output)
-    this.app.event('message', async ({ event }) => {
+    this.app.event('message', async ({ event }: { event: any }) => {
       // Bolt's event type is the full MessageEvent union (17+ subtypes).
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
@@ -145,10 +171,10 @@ export class SlackChannel implements Channel {
         }
       }
 
-      // Download image attachments (never crash if download/permissions fail)
+      // Download file attachments (never crash if download/permissions fail)
       let attachments: MessageAttachment[] = [];
       try {
-        attachments = await this.downloadImageFiles(
+        attachments = await this.downloadFiles(
           files,
           groups[jid].folder,
           msg.ts,
@@ -175,7 +201,7 @@ export class SlackChannel implements Channel {
   }
 
   async connect(): Promise<void> {
-    await this.app.start();
+    await this.app.start(this.webhookListenOpts);
 
     // Get bot's own user ID for self-message detection.
     // Resolve this BEFORE setting connected=true so that messages arriving
@@ -264,7 +290,11 @@ export class SlackChannel implements Channel {
       await this.app.client.auth.test();
     } catch (err) {
       logger.warn({ err }, 'Slack health check failed, reconnecting');
-      await this.reconnect();
+      // HTTP webhook mode has no persistent socket to reconnect; a failed
+      // auth.test just means a transient API hiccup — log and continue.
+      if (this.mode === 'socket') {
+        await this.reconnect();
+      }
     }
   }
 
@@ -280,7 +310,7 @@ export class SlackChannel implements Channel {
         // already stopped
       }
 
-      await this.app.start();
+      await this.app.start(this.webhookListenOpts);
 
       try {
         const auth = await this.app.client.auth.test();
@@ -357,7 +387,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async downloadImageFiles(
+  private async downloadFiles(
     files: GenericMessageEvent['files'] | undefined,
     groupFolder: string,
     messageTs: string,
@@ -372,11 +402,10 @@ export class SlackChannel implements Channel {
     if (!botToken) return [];
 
     for (const file of files) {
-      if (!file.mimetype || !IMAGE_MIMETYPES.has(file.mimetype)) continue;
-      if ((file.size ?? 0) > MAX_IMAGE_SIZE) {
+      if ((file.size ?? 0) > MAX_FILE_SIZE) {
         logger.debug(
           { fileId: file.id, size: file.size },
-          'Slack image too large, skipping',
+          'Slack file too large, skipping',
         );
         continue;
       }
@@ -391,12 +420,12 @@ export class SlackChannel implements Channel {
         if (!resp.ok) {
           logger.warn(
             { fileId: file.id, status: resp.status },
-            'Failed to download Slack image',
+            'Failed to download Slack file',
           );
           continue;
         }
 
-        const ext = file.filetype || file.mimetype.split('/')[1] || 'bin';
+        const ext = file.filetype || file.mimetype?.split('/')[1] || 'bin';
         const safeName = `${messageTs.replace('.', '-')}-${file.id}.${ext}`;
         const filePath = path.join(attachDir, safeName);
 
@@ -411,10 +440,10 @@ export class SlackChannel implements Channel {
 
         logger.info(
           { fileId: file.id, filename: file.name, size: buffer.length },
-          'Slack image downloaded',
+          'Slack file downloaded',
         );
       } catch (err) {
-        logger.warn({ fileId: file.id, err }, 'Error downloading Slack image');
+        logger.warn({ fileId: file.id, err }, 'Error downloading Slack file');
       }
     }
 
@@ -448,9 +477,19 @@ export class SlackChannel implements Channel {
 }
 
 registerChannel('slack', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
-  if (!envVars.SLACK_BOT_TOKEN || !envVars.SLACK_APP_TOKEN) {
-    logger.warn('Slack: SLACK_BOT_TOKEN or SLACK_APP_TOKEN not set');
+  const envVars = readEnvFile([
+    'SLACK_BOT_TOKEN',
+    'SLACK_APP_TOKEN',
+    'SLACK_SIGNING_SECRET',
+  ]);
+  if (!envVars.SLACK_BOT_TOKEN) {
+    logger.warn('Slack: SLACK_BOT_TOKEN not set');
+    return null;
+  }
+  if (!envVars.SLACK_APP_TOKEN && !envVars.SLACK_SIGNING_SECRET) {
+    logger.warn(
+      'Slack: neither SLACK_APP_TOKEN (Socket Mode) nor SLACK_SIGNING_SECRET (HTTP webhooks) is set',
+    );
     return null;
   }
   return new SlackChannel(opts);

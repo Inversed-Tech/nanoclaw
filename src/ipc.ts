@@ -6,7 +6,9 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { isHostRequestsEnabled, HostRequest } from './gateway-client.js';
 import { isValidGroupFolder } from './group-folder.js';
+import { handleHostRequest } from './host-request-runner.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -152,6 +154,60 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
   processIpcFiles();
   logger.info('IPC watcher started (per-group namespaces)');
+
+  // Host-requests watcher (global, not per-group)
+  // Only enabled when Gateway credentials are configured
+  if (isHostRequestsEnabled()) {
+    const hostReqDir = path.join(ipcBaseDir, 'host-requests');
+    fs.mkdirSync(hostReqDir, { recursive: true });
+
+    // Helper: resolve a group folder name back to its JID
+    const resolveGroupJid = (folder: string): string | undefined => {
+      const groups = deps.registeredGroups();
+      for (const [jid, group] of Object.entries(groups)) {
+        if (group.folder === folder) return jid;
+      }
+      return undefined;
+    };
+
+    const processHostRequests = async () => {
+      try {
+        const files = fs
+          .readdirSync(hostReqDir)
+          .filter((f) => f.endsWith('.json') && !f.endsWith('.result.json'));
+
+        for (const file of files) {
+          const filePath = path.join(hostReqDir, file);
+          try {
+            const req: HostRequest = JSON.parse(
+              fs.readFileSync(filePath, 'utf-8'),
+            );
+            if (req.status !== 'pending') continue;
+
+            logger.info(
+              { requestId: req.id, title: req.title },
+              'Processing host request',
+            );
+            await handleHostRequest(req, deps.sendMessage, resolveGroupJid);
+          } catch (err) {
+            logger.error({ file, err }, 'Error processing host request');
+            const errorDir = path.join(ipcBaseDir, 'errors');
+            fs.mkdirSync(errorDir, { recursive: true });
+            fs.renameSync(filePath, path.join(errorDir, `host-req-${file}`));
+          }
+        }
+      } catch (err) {
+        logger.error({ err }, 'Error reading host-requests directory');
+      }
+
+      setTimeout(processHostRequests, IPC_POLL_INTERVAL);
+    };
+
+    processHostRequests();
+    logger.info('Host request watcher started');
+  } else {
+    logger.info('Host requests disabled (Gateway credentials not configured)');
+  }
 }
 
 export async function processTaskIpc(
