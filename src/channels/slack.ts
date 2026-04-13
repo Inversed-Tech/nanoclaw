@@ -1,4 +1,6 @@
+import bolt from '@slack/bolt';
 import { App, LogLevel } from '@slack/bolt';
+const { HTTPReceiver } = bolt;
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
@@ -17,6 +19,12 @@ import {
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
 
+// Health check interval: ping Slack every 5 minutes to detect stale sockets.
+const HEALTH_CHECK_MS = 5 * 60 * 1000;
+
+// Default port for HTTP webhook receiver.
+const DEFAULT_WEBHOOK_PORT = 3000;
+
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
@@ -32,11 +40,15 @@ export class SlackChannel implements Channel {
   name = 'slack';
 
   private app: App;
+  private mode: 'socket' | 'webhook';
+  private webhookListenOpts: { port: number; host: string } | undefined;
   private botUserId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  private healthTimer: ReturnType<typeof setInterval> | undefined;
+  private reconnecting = false;
 
   private opts: SlackChannelOpts;
 
@@ -45,22 +57,50 @@ export class SlackChannel implements Channel {
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
     // so they don't leak to child processes, matching NanoClaw's security pattern)
-    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
+    const env = readEnvFile([
+      'SLACK_BOT_TOKEN',
+      'SLACK_APP_TOKEN',
+      'SLACK_SIGNING_SECRET',
+      'SLACK_PORT',
+      'SLACK_HOST',
+    ]);
     const botToken = env.SLACK_BOT_TOKEN;
     const appToken = env.SLACK_APP_TOKEN;
+    const signingSecret = env.SLACK_SIGNING_SECRET;
 
-    if (!botToken || !appToken) {
-      throw new Error(
-        'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env',
-      );
+    if (!botToken) {
+      throw new Error('SLACK_BOT_TOKEN must be set in .env');
     }
 
-    this.app = new App({
-      token: botToken,
-      appToken,
-      socketMode: true,
-      logLevel: LogLevel.ERROR,
-    });
+    if (appToken) {
+      // Socket Mode: bidirectional WebSocket, no public URL required.
+      this.mode = 'socket';
+      this.app = new App({
+        token: botToken,
+        appToken,
+        socketMode: true,
+        logLevel: LogLevel.ERROR,
+      });
+    } else if (signingSecret) {
+      // HTTP Webhook mode: Slack POSTs events to /slack/events.
+      // Requires a public URL pointed at SLACK_PORT (default: 3000).
+      this.mode = 'webhook';
+      const port = env.SLACK_PORT
+        ? parseInt(env.SLACK_PORT, 10)
+        : DEFAULT_WEBHOOK_PORT;
+      const host = env.SLACK_HOST ?? '127.0.0.1';
+      this.webhookListenOpts = { port, host };
+      const receiver = new HTTPReceiver({ signingSecret, port });
+      this.app = new App({
+        token: botToken,
+        receiver,
+        logLevel: LogLevel.ERROR,
+      });
+    } else {
+      throw new Error(
+        'Either SLACK_APP_TOKEN (Socket Mode) or SLACK_SIGNING_SECRET (HTTP webhooks) must be set in .env',
+      );
+    }
 
     this.setupEventHandlers();
   }
@@ -132,7 +172,11 @@ export class SlackChannel implements Channel {
   }
 
   async connect(): Promise<void> {
-    await this.app.start();
+    if (this.webhookListenOpts) {
+      await this.app.start(this.webhookListenOpts);
+    } else {
+      await this.app.start();
+    }
 
     // Get bot's own user ID for self-message detection.
     // Resolve this BEFORE setting connected=true so that messages arriving
@@ -155,6 +199,9 @@ export class SlackChannel implements Channel {
 
     // Sync channel names on startup
     await this.syncChannelMetadata();
+
+    // Start periodic health checks to detect stale sockets
+    this.startHealthCheck();
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -201,7 +248,67 @@ export class SlackChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
     await this.app.stop();
+  }
+
+  private startHealthCheck(): void {
+    this.healthTimer = setInterval(() => {
+      this.checkHealth().catch(() => {});
+    }, HEALTH_CHECK_MS);
+  }
+
+  private async checkHealth(): Promise<void> {
+    if (!this.connected || this.reconnecting) return;
+
+    try {
+      await this.app.client.auth.test();
+    } catch (err) {
+      logger.warn({ err }, 'Slack health check failed, reconnecting');
+      // HTTP webhook mode has no persistent socket to reconnect; a failed
+      // auth.test just means a transient API hiccup — log and continue.
+      if (this.mode === 'socket') {
+        await this.reconnect();
+      }
+    }
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+
+    try {
+      this.connected = false;
+      try {
+        await this.app.stop();
+      } catch {
+        // already stopped
+      }
+
+      if (this.webhookListenOpts) {
+        await this.app.start(this.webhookListenOpts);
+      } else {
+        await this.app.start();
+      }
+
+      try {
+        const auth = await this.app.client.auth.test();
+        this.botUserId = auth.user_id as string;
+      } catch {
+        // non-fatal — botUserId is already set from initial connect
+      }
+
+      this.connected = true;
+      logger.info('Slack reconnected after health check failure');
+      await this.flushOutgoingQueue();
+    } catch (err) {
+      logger.error({ err }, 'Slack reconnect failed');
+    } finally {
+      this.reconnecting = false;
+    }
   }
 
   // Slack does not expose a typing indicator API for bots.
@@ -291,9 +398,19 @@ export class SlackChannel implements Channel {
 }
 
 registerChannel('slack', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
-  if (!envVars.SLACK_BOT_TOKEN || !envVars.SLACK_APP_TOKEN) {
-    logger.warn('Slack: SLACK_BOT_TOKEN or SLACK_APP_TOKEN not set');
+  const envVars = readEnvFile([
+    'SLACK_BOT_TOKEN',
+    'SLACK_APP_TOKEN',
+    'SLACK_SIGNING_SECRET',
+  ]);
+  if (!envVars.SLACK_BOT_TOKEN) {
+    logger.warn('Slack: SLACK_BOT_TOKEN not set');
+    return null;
+  }
+  if (!envVars.SLACK_APP_TOKEN && !envVars.SLACK_SIGNING_SECRET) {
+    logger.warn(
+      'Slack: neither SLACK_APP_TOKEN (Socket Mode) nor SLACK_SIGNING_SECRET (HTTP webhooks) is set',
+    );
     return null;
   }
   return new SlackChannel(opts);
