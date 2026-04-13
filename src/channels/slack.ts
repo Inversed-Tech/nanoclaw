@@ -19,6 +19,9 @@ import {
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
 
+// Health check interval: ping Slack every 5 minutes to detect stale sockets.
+const HEALTH_CHECK_MS = 5 * 60 * 1000;
+
 // Default port for HTTP webhook receiver.
 const DEFAULT_WEBHOOK_PORT = 3000;
 
@@ -44,6 +47,8 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  private healthTimer: ReturnType<typeof setInterval> | undefined;
+  private reconnecting = false;
 
   private opts: SlackChannelOpts;
 
@@ -194,6 +199,9 @@ export class SlackChannel implements Channel {
 
     // Sync channel names on startup
     await this.syncChannelMetadata();
+
+    // Start periodic health checks to detect stale sockets
+    this.startHealthCheck();
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -239,6 +247,10 @@ export class SlackChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
     this.connected = false;
     await this.app.stop();
   }
@@ -300,6 +312,51 @@ export class SlackChannel implements Channel {
     } catch (err) {
       logger.debug({ userId, err }, 'Failed to resolve Slack user name');
       return undefined;
+    }
+  }
+
+  private startHealthCheck(): void {
+    this.healthTimer = setInterval(() => {
+      this.checkHealth().catch(() => {});
+    }, HEALTH_CHECK_MS);
+  }
+
+  private async checkHealth(): Promise<void> {
+    if (!this.connected || this.reconnecting) return;
+    try {
+      await this.app.client.auth.test();
+    } catch (err) {
+      logger.warn({ err }, 'Slack health check failed, reconnecting');
+      // HTTP webhook mode has no persistent socket to reconnect; a failed
+      // auth.test just means a transient API hiccup — log and continue.
+      if (this.mode === 'socket') {
+        await this.reconnect();
+      }
+    }
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    try {
+      this.connected = false;
+      try { await this.app.stop(); } catch { /* already stopped */ }
+      if (this.webhookListenOpts) {
+        await this.app.start(this.webhookListenOpts);
+      } else {
+        await this.app.start();
+      }
+      try {
+        const auth = await this.app.client.auth.test();
+        this.botUserId = auth.user_id as string;
+      } catch { /* non-fatal */ }
+      this.connected = true;
+      logger.info('Slack reconnected after health check failure');
+      await this.flushOutgoingQueue();
+    } catch (err) {
+      logger.error({ err }, 'Slack reconnect failed');
+    } finally {
+      this.reconnecting = false;
     }
   }
 
