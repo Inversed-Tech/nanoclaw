@@ -332,6 +332,6 @@ The Slack channel supports:
 - **Threads are flattened** — Threaded replies are delivered to the agent as regular channel messages. The agent sees them but has no awareness they originated in a thread. Responses always go to the channel, not back into the thread. Users in a thread will need to check the main channel for the bot's reply.
 - **No typing indicator** — Slack's Bot API does not expose a typing indicator endpoint. The `setTyping()` method is a no-op.
 - **Message splitting is naive** — Long messages are split at a fixed 4000-character boundary, which may break mid-word or mid-sentence.
-- **No file/image handling** — The bot only processes text content. File uploads, images, and rich message blocks are not forwarded to the agent.
+- **Image support requires `files:read` scope** — The bot downloads image attachments (PNG, JPEG, GIF, WebP up to 10 MB) and forwards them to the agent. If the scope is missing, images are silently skipped but the text message is still delivered. Rich message blocks are not forwarded.
 - **Channel metadata sync is unbounded** — `syncChannelMetadata()` paginates through all channels the bot is a member of with no upper bound. Large workspaces may experience slow startup.
 - **HTTP mode: no automatic retry on delivery failure** — In Socket Mode, the WebSocket reconnects automatically. In HTTP Webhook mode, if NanoClaw is down when Slack delivers an event, Slack retries for up to 3 days with exponential backoff, but events delivered during the outage window may arrive out of order.
