@@ -279,10 +279,6 @@ export class SlackChannel implements Channel {
       this.healthTimer = undefined;
     }
     this.connected = false;
-    if (this.healthTimer) {
-      clearInterval(this.healthTimer);
-      this.healthTimer = undefined;
-    }
     await this.app.stop();
   }
 
@@ -369,7 +365,11 @@ export class SlackChannel implements Channel {
     this.reconnecting = true;
     try {
       this.connected = false;
-      try { await this.app.stop(); } catch { /* already stopped */ }
+      try {
+        await this.app.stop();
+      } catch {
+        /* already stopped */
+      }
       if (this.webhookListenOpts) {
         await this.app.start(this.webhookListenOpts);
       } else {
@@ -378,7 +378,9 @@ export class SlackChannel implements Channel {
       try {
         const auth = await this.app.client.auth.test();
         this.botUserId = auth.user_id as string;
-      } catch { /* non-fatal */ }
+      } catch {
+        /* non-fatal */
+      }
       this.connected = true;
       logger.info('Slack reconnected after health check failure');
       await this.flushOutgoingQueue();
