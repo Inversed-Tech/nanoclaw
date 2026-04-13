@@ -1,8 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 
-import boltPkg from '@slack/bolt';
-const { App, HTTPReceiver, LogLevel } = boltPkg as any;
+import bolt from '@slack/bolt';
+import { App, LogLevel } from '@slack/bolt';
+const { HTTPReceiver } = bolt;
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
@@ -45,7 +46,7 @@ export interface SlackChannelOpts {
 export class SlackChannel implements Channel {
   name = 'slack';
 
-  private app: InstanceType<typeof App>;
+  private app: App;
   private mode: 'socket' | 'webhook';
   private webhookListenOpts: { port: number; host: string } | undefined;
   private botUserId: string | undefined;
@@ -201,7 +202,11 @@ export class SlackChannel implements Channel {
   }
 
   async connect(): Promise<void> {
-    await this.app.start(this.webhookListenOpts);
+    if (this.webhookListenOpts) {
+      await this.app.start(this.webhookListenOpts);
+    } else {
+      await this.app.start();
+    }
 
     // Get bot's own user ID for self-message detection.
     // Resolve this BEFORE setting connected=true so that messages arriving
@@ -269,64 +274,16 @@ export class SlackChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
     this.connected = false;
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
       this.healthTimer = undefined;
     }
     await this.app.stop();
-  }
-
-  private startHealthCheck(): void {
-    this.healthTimer = setInterval(() => {
-      this.checkHealth().catch(() => {});
-    }, HEALTH_CHECK_MS);
-  }
-
-  private async checkHealth(): Promise<void> {
-    if (!this.connected || this.reconnecting) return;
-
-    try {
-      await this.app.client.auth.test();
-    } catch (err) {
-      logger.warn({ err }, 'Slack health check failed, reconnecting');
-      // HTTP webhook mode has no persistent socket to reconnect; a failed
-      // auth.test just means a transient API hiccup — log and continue.
-      if (this.mode === 'socket') {
-        await this.reconnect();
-      }
-    }
-  }
-
-  private async reconnect(): Promise<void> {
-    if (this.reconnecting) return;
-    this.reconnecting = true;
-
-    try {
-      this.connected = false;
-      try {
-        await this.app.stop();
-      } catch {
-        // already stopped
-      }
-
-      await this.app.start(this.webhookListenOpts);
-
-      try {
-        const auth = await this.app.client.auth.test();
-        this.botUserId = auth.user_id as string;
-      } catch {
-        // non-fatal — botUserId is already set from initial connect
-      }
-
-      this.connected = true;
-      logger.info('Slack reconnected after health check failure');
-      await this.flushOutgoingQueue();
-    } catch (err) {
-      logger.error({ err }, 'Slack reconnect failed');
-    } finally {
-      this.reconnecting = false;
-    }
   }
 
   // Slack does not expose a typing indicator API for bots.
@@ -384,6 +341,51 @@ export class SlackChannel implements Channel {
     } catch (err) {
       logger.debug({ userId, err }, 'Failed to resolve Slack user name');
       return undefined;
+    }
+  }
+
+  private startHealthCheck(): void {
+    this.healthTimer = setInterval(() => {
+      this.checkHealth().catch(() => {});
+    }, HEALTH_CHECK_MS);
+  }
+
+  private async checkHealth(): Promise<void> {
+    if (!this.connected || this.reconnecting) return;
+    try {
+      await this.app.client.auth.test();
+    } catch (err) {
+      logger.warn({ err }, 'Slack health check failed, reconnecting');
+      // HTTP webhook mode has no persistent socket to reconnect; a failed
+      // auth.test just means a transient API hiccup — log and continue.
+      if (this.mode === 'socket') {
+        await this.reconnect();
+      }
+    }
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    try {
+      this.connected = false;
+      try { await this.app.stop(); } catch { /* already stopped */ }
+      if (this.webhookListenOpts) {
+        await this.app.start(this.webhookListenOpts);
+      } else {
+        await this.app.start();
+      }
+      try {
+        const auth = await this.app.client.auth.test();
+        this.botUserId = auth.user_id as string;
+      } catch { /* non-fatal */ }
+      this.connected = true;
+      logger.info('Slack reconnected after health check failure');
+      await this.flushOutgoingQueue();
+    } catch (err) {
+      logger.error({ err }, 'Slack reconnect failed');
+    } finally {
+      this.reconnecting = false;
     }
   }
 
